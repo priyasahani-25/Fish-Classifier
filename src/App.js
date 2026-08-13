@@ -1,39 +1,44 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useRef } from 'react';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import { UploadCloud, Cpu, CheckCircle, Leaf } from 'lucide-react';
 import './App.css';
 
-// Initialize Gemini (We will paste your actual key here)
+// Initialize Gemini
 const genAI = new GoogleGenerativeAI(process.env.REACT_APP_GEMINI_API_KEY);
 
 function App() {
   const [imagePreview, setImagePreview] = useState(null);
+  const [imageFile, setImageFile] = useState(null);
   const [results, setResults] = useState(null);
   const [isInferencing, setIsInferencing] = useState(false);
   const [sustainabilityReport, setSustainabilityReport] = useState(null);
   
   const imageRef = useRef(null);
-  const canvasRef = useRef(null);
-
-  useEffect(() => {
-    const checkAI = setInterval(() => {
-      if (window.EdgeImpulseClassifier) {
-        console.log("Edge Impulse AI Loaded!");
-        clearInterval(checkAI); 
-      }
-    }, 500);
-    return () => clearInterval(checkAI);
-  }, []);
 
   const handleImageUpload = (event) => {
     const file = event.target.files[0];
     if (file) {
       setImagePreview(URL.createObjectURL(file));
+      setImageFile(file);
       setResults(null); 
       setSustainabilityReport(null);
     }
   };
 
-  // --- GEMINI API LOGIC ---
+  // Convert file to base64 for Gemini Vision
+  const fileToBase64 = (file) => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.readAsDataURL(file);
+      reader.onload = () => {
+        const base64 = reader.result.split(',')[1];
+        resolve(base64);
+      };
+      reader.onerror = reject;
+    });
+  };
+
+  // --- GEMINI SUSTAINABILITY REPORT ---
   const generateSustainabilityReport = async (fishName) => {
     setSustainabilityReport("Consulting global supply chain database via Gemini...");
     try {
@@ -48,97 +53,162 @@ function App() {
     }
   };
 
-  // --- EDGE IMPULSE LOGIC ---
+  // --- GEMINI VISION CLASSIFICATION ---
   const runInference = async () => {
-    if (!imageRef.current) return;
+    if (!imageFile) return;
     setIsInferencing(true);
+    setResults(null);
+    setSustainabilityReport(null);
 
     try {
-      const classifier = new window.EdgeImpulseClassifier();
-      await classifier.init();
+      const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
-      const canvas = canvasRef.current;
-      const ctx = canvas.getContext('2d');
-      ctx.drawImage(imageRef.current, 0, 0, 96, 96);
+      const base64Data = await fileToBase64(imageFile);
+      const imagePart = {
+        inlineData: {
+          data: base64Data,
+          mimeType: imageFile.type,
+        },
+      };
+
+      const prompt = `You are a marine biologist and fish species classifier. Analyze this image and identify the fish species shown.
+
+Respond ONLY with valid JSON in this exact format (no markdown, no code fences, just raw JSON):
+{
+  "species": "Common Name of the Fish",
+  "scientific_name": "Scientific name",
+  "confidence": 0.85,
+  "all_matches": [
+    {"label": "Species 1", "value": 0.85},
+    {"label": "Species 2", "value": 0.10},
+    {"label": "Species 3", "value": 0.05}
+  ]
+}
+
+Rules:
+- "confidence" must be a number between 0 and 1 representing how sure you are.
+- "all_matches" should list the top 3 most likely species with their probabilities summing to roughly 1.
+- If the image does not contain a fish, set species to "NOT A FISH" and confidence to 0.
+- Be accurate and honest about your confidence level.`;
+
+      const result = await model.generateContent([prompt, imagePart]);
+      const responseText = result.response.text().trim();
       
-      const imgData = ctx.getImageData(0, 0, 96, 96).data;
-      const features = [];
-      for (let i = 0; i < imgData.length; i += 4) {
-        features.push((imgData[i] << 16) | (imgData[i + 1] << 8) | imgData[i + 2]);
+      // Parse the JSON response
+      let parsed;
+      try {
+        // Remove markdown code fences if present
+        const cleanJson = responseText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+        parsed = JSON.parse(cleanJson);
+      } catch (parseErr) {
+        console.error("Failed to parse Gemini response:", responseText);
+        setResults([{ label: "PARSE ERROR", value: 0 }]);
+        setIsInferencing(false);
+        return;
       }
 
-      const res = classifier.classify(features);
-      console.log("🎯 AI RAW OUTPUT:", res);
-      
-      if (res.results && res.results.length > 0) {
-        setResults(res.results);
-        generateSustainabilityReport(res.results[0].label); // Ask Gemini!
+      console.log("🎯 Gemini Vision Output:", parsed);
+
+      if (parsed.all_matches && parsed.all_matches.length > 0) {
+        const sortedResults = parsed.all_matches.sort((a, b) => b.value - a.value);
+        setResults(sortedResults);
+        generateSustainabilityReport(sortedResults[0].label);
       } else {
-        setResults([]); // No fish found
+        setResults([{ label: parsed.species || "UNKNOWN", value: parsed.confidence || 0 }]);
+        if (parsed.species && parsed.species !== "NOT A FISH") {
+          generateSustainabilityReport(parsed.species);
+        }
       }
+
       setIsInferencing(false);
-      
     } catch (err) {
-      console.error(err);
+      console.error("Classification error:", err);
+      setResults([{ label: "ERROR", value: 0 }]);
+      setSustainabilityReport("Classification failed. Please check your API key and try again.");
       setIsInferencing(false);
     }
   };
 
-  // --- DEVELOPER TEST OVERRIDE ---
-  // Use this for your project presentation if the CV model fails
-  const simulateDetection = () => {
-    const mockResult = [{ label: "BLACK-SEA-SPRAT", value: 0.92 }];
-    setResults(mockResult);
-    generateSustainabilityReport(mockResult[0].label);
-  };
-
   const topMatch = results && results.length > 0 ? results[0] : { label: "UNKNOWN", value: 0 };
+  const hasResults = results && results.length > 0 && topMatch.label !== "UNKNOWN" && topMatch.label !== "ERROR";
 
   return (
     <div className="dashboard-container">
       <header className="dashboard-header">
-        <h1>Marine Supply Chain Tracker</h1>
-        <p>SDG 12: Responsible Consumption and Production</p>
+        <div>
+          <h1><img src="/logo.png" alt="Logo" className="header-logo" /> Marine Supply Chain Tracker</h1>
+          <p className="header-subtitle">SDG 12: Responsible Consumption and Production</p>
+        </div>
       </header>
 
       <main className="dashboard-main">
-        {/* Left Column */}
-        <div className="vision-container">
-          <input type="file" accept="image/*" onChange={handleImageUpload} />
-          <div className="image-workspace">
-            {imagePreview ? (
-              <img ref={imageRef} src={imagePreview} alt="Uploaded fish" className="fish-image" crossOrigin="anonymous"/>
-            ) : (
-              <p className="placeholder-text">Upload an image to run inference...</p>
-            )}
+        {/* Left Column - Input */}
+        <div className="card vision-container">
+          <h2 className="card-title"><UploadCloud size={20} /> Vision Input</h2>
+          
+          <div className="upload-section">
+            <div className="file-input-wrapper">
+              <button className="btn btn-secondary">Choose Image</button>
+              <input type="file" accept="image/*" onChange={handleImageUpload} />
+            </div>
           </div>
 
-          <div className="ai-sensor-panel" style={{ margin: '15px 0', textAlign: 'center', color: '#00ffcc' }}>
-            <p style={{ margin: '0 0 5px 0', fontSize: '12px' }}>LIVE AI SENSOR INPUT (96x96):</p>
-            <canvas ref={canvasRef} width="96" height="96" style={{ border: '1px solid #333', backgroundColor: '#111' }}></canvas>
+          <div className="image-workspace">
+            {imagePreview ? (
+              <img ref={imageRef} src={imagePreview} alt="Uploaded fish" className="fish-image" />
+            ) : (
+              <div className="placeholder-text">
+                <UploadCloud size={32} />
+                <p>Upload an image to run inference...</p>
+              </div>
+            )}
           </div>
           
-          <button className="inference-btn" onClick={runInference} disabled={!imagePreview || isInferencing}>
-            {isInferencing ? "Analyzing..." : "Run AI Classification"}
-          </button>
-          
-          {/* Dev Test Button for Presentations */}
-          <button onClick={simulateDetection} style={{ marginTop: '10px', background: '#444', color: 'white', padding: '5px', border: 'none', cursor: 'pointer' }}>
-            [Dev Test: Force Detection]
+          <button className="btn" onClick={runInference} disabled={!imageFile || isInferencing} style={{width: '100%', justifyContent: 'center'}}>
+            {isInferencing ? <><Cpu className="animate-spin" size={18} /> Analyzing...</> : <><Cpu size={18} /> Run AI Classification</>}
           </button>
         </div>
 
-        {/* Right Column */}
-        <div className="info-panel">
-          <h3>Classified: {topMatch.label.toUpperCase()}</h3>
-          <hr />
-          <p><strong>Confidence:</strong> {(topMatch.value * 100).toFixed(1)}%</p>
-          <p><strong>Supply Chain Status:</strong> {results && results.length > 0 ? "Verified" : "--"}</p>
+        {/* Right Column - Results */}
+        <div className="card info-panel">
+          <h2 className="card-title"><CheckCircle size={20} /> Classification Results</h2>
           
-          <div className="gemini-output" style={{ marginTop: '20px', padding: '15px', backgroundColor: '#1a1a1a', borderRadius: '5px', borderLeft: '4px solid #00ffcc' }}>
-            <h4 style={{ margin: '0 0 10px 0', color: '#00ffcc' }}>SDG 12 Impact Report:</h4>
-            <p style={{ margin: 0, fontSize: '14px', lineHeight: '1.5' }}>
-              {sustainabilityReport ? sustainabilityReport : "Waiting for successful species identification..."}
+          <div className="result-stats">
+            <div className="result-stat">
+              <span className="stat-label">Species Detected</span>
+              <span className="stat-value">{topMatch.label.replace(/-/g, ' ').toUpperCase()}</span>
+            </div>
+            <div className="result-stat">
+              <span className="stat-label">Confidence</span>
+              <span className="stat-value">{(topMatch.value * 100).toFixed(1)}%</span>
+            </div>
+            <div className="result-stat">
+              <span className="stat-label">Supply Chain Status</span>
+              {hasResults ? (
+                <span className="stat-value verified"><CheckCircle size={16} /> Verified</span>
+              ) : (
+                <span className="stat-value" style={{color: 'var(--text-secondary)'}}>Pending</span>
+              )}
+            </div>
+          </div>
+
+          {/* Show all candidate matches if available */}
+          {results && results.length > 1 && (
+            <div className="report-box" style={{borderLeftColor: 'var(--border-color)'}}>
+              <h4>All Candidate Matches</h4>
+              {results.map((r, i) => (
+                <div key={i} className="result-stat">
+                  <span className="stat-label">{r.label}</span>
+                  <span className="stat-value">{(r.value * 100).toFixed(1)}%</span>
+                </div>
+              ))}
+            </div>
+          )}
+          
+          <div className="report-box">
+            <h4><Leaf size={18} /> SDG 12 Impact Report</h4>
+            <p>
+              {sustainabilityReport ? sustainabilityReport : "Waiting for successful species identification to generate report..."}
             </p>
           </div>
         </div>
